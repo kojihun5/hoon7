@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>음성 인식 + 실시간 한→영 번역</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Malgun Gothic", sans-serif;
+    margin: 0; padding: 24px; background: #f5f6f8; color: #222;
+    display: flex; justify-content: center;
+  }
+  .wrap { width: 100%; max-width: 900px; }
+  h1 { font-size: 20px; margin: 0 0 16px; }
+  .panel { background: #fff; border-radius: 12px; padding: 20px; box-shadow: 0 2px 8px rgba(0,0,0,.08); }
+  .controls { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 14px; }
+  button { border: none; border-radius: 8px; padding: 10px 18px; font-size: 14px; font-weight: 600; cursor: pointer; }
+  #startBtn { background: #2563eb; color: #fff; }
+  #startBtn.rec { background: #dc2626; }
+  #clearBtn, #copyBtn, #speakBtn { background: #e5e7eb; color: #333; }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  label.chk { font-size: 13px; display: flex; align-items: center; gap: 4px; }
+  .meter { height: 6px; background: #e5e7eb; border-radius: 3px; overflow: hidden; margin-bottom: 12px; }
+  .meter > div { height: 100%; width: 0%; background: #22c55e; transition: width .08s; }
+  #status { font-size: 13px; color: #6b7280; margin-bottom: 12px; min-height: 18px; }
+  .cols { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  @media (max-width: 680px) { .cols { grid-template-columns: 1fr; } }
+  .col h2 { font-size: 13px; margin: 0 0 6px; color: #374151; letter-spacing: .3px; }
+  textarea {
+    width: 100%; min-height: 220px; padding: 14px;
+    border: 1px solid #d1d5db; border-radius: 8px;
+    font-size: 15px; line-height: 1.7; resize: vertical; font-family: inherit;
+  }
+  #enOut { background: #f9fafb; }
+  .ghost { color: #9ca3af; font-size: 14px; margin: 6px 0 0; min-height: 20px; }
+  .badge { display:inline-block; font-size:11px; padding:3px 8px; border-radius:999px; margin-left:6px; }
+  .ok { background:#dcfce7; color:#15803d; } .bad { background:#fee2e2; color:#b91c1c; }
+  .note { font-size: 12px; color: #6b7280; margin-top: 14px; line-height: 1.7; }
+  code { background:#f3f4f6; padding:1px 5px; border-radius:4px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>🎤 한국어 음성 → 실시간 영어 번역</h1>
+  <div class="panel">
+    <div class="controls">
+      <button id="startBtn">녹음 시작</button>
+      <label class="chk"><input type="checkbox" id="cont" checked> 연속 인식</label>
+      <label class="chk"><input type="checkbox" id="autoTr" checked> 자동 번역</label>
+      <button id="speakBtn">영어 읽기</button>
+      <button id="copyBtn">영문 복사</button>
+      <button id="clearBtn">지우기</button>
+      <span id="trBadge" class="badge bad">번역엔진 확인중</span>
+    </div>
+    <div class="meter"><div id="level"></div></div>
+    <div id="status">대기 중</div>
+
+    <div class="cols">
+      <div class="col">
+        <h2>🇰🇷 인식된 한국어</h2>
+        <textarea id="koOut" placeholder="말하면 여기에 표시됩니다."></textarea>
+        <p id="interim" class="ghost"></p>
+      </div>
+      <div class="col">
+        <h2>🇺🇸 영어 번역</h2>
+        <textarea id="enOut" placeholder="Translation appears here." readonly></textarea>
+        <p id="trInterim" class="ghost"></p>
+      </div>
+    </div>
+
+    <p class="note">
+      음성 인식은 <code>Web Speech API</code>, 번역은 Chrome 내장 온디바이스
+      <code>Translator API</code>(Chrome 138+)를 사용합니다. 외부 서버·API 키 없음.<br>
+      번역엔진 미지원 시 <code>chrome://flags</code> → <em>Translation API</em> 활성화가 필요할 수 있습니다.
+    </p>
+  </div>
+</div>
+
+<script>
+(function () {
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  const $ = id => document.getElementById(id);
+  const startBtn=$('startBtn'), koOut=$('koOut'), enOut=$('enOut'),
+        interim=$('interim'), trInterim=$('trInterim'), statusEl=$('status'),
+        contChk=$('cont'), autoTr=$('autoTr'), level=$('level'), trBadge=$('trBadge');
+
+  /* ---------- 1. 번역 엔진 (Chrome 내장 Translator API) ---------- */
+  let translator = null;
+
+  async function initTranslator() {
+    const API = self.Translator || self.translation;   // 신/구 네임스페이스
+    if (!API) { trBadge.textContent = '번역 미지원 브라우저'; return; }
+    try {
+      const opts = { sourceLanguage: 'ko', targetLanguage: 'en' };
+      const avail = API.availability
+        ? await API.availability(opts)
+        : await API.canTranslate(opts);
+      if (avail === 'unavailable' || avail === 'no') {
+        trBadge.textContent = 'ko→en 모델 없음'; return;
+      }
+      trBadge.textContent = avail === 'available' || avail === 'readily'
+        ? '모델 준비됨' : '모델 다운로드 중...';
+      translator = await (API.create ? API.create({
+        ...opts,
+        monitor(m) {
+          m.addEventListener('downloadprogress', e => {
+            trBadge.textContent = `모델 ${Math.round((e.loaded||0)*100)}%`;
+          });
+        }
+      }) : API.createTranslator(opts));
+      trBadge.textContent = '번역 준비 완료';
+      trBadge.className = 'badge ok';
+    } catch (e) {
+      trBadge.textContent = '번역 초기화 실패';
+    }
+  }
+  initTranslator();
+
+  async function translate(text) {
+    if (!translator || !text.trim()) return '';
+    try { return await translator.translate(text); }
+    catch (_) { return ''; }
+  }
+
+  // 임시(중간) 결과는 과도한 호출 방지를 위해 디바운스
+  let debTimer = null;
+  function debouncedInterimTranslate(text) {
+    clearTimeout(debTimer);
+    debTimer = setTimeout(async () => {
+      if (!autoTr.checked) return;
+      trInterim.textContent = await translate(text);
+    }, 350);
+  }
+
+  /* ---------- 2. 음성 인식 ---------- */
+  if (!SR) {
+    statusEl.textContent = '이 브라우저는 음성 인식을 지원하지 않습니다. Chrome/Edge를 사용하세요.';
+    startBtn.disabled = true; return;
+  }
+
+  let recog=null, running=false, manualStop=false;
+  let audioCtx, analyser, micStream, rafId;
+
+  function appendTo(el, txt) {
+    el.value += (el.value && !/\s$/.test(el.value) ? ' ' : '') + txt.trim();
+    el.scrollTop = el.scrollHeight;
+  }
+
+  function buildRecognizer() {
+    const r = new SR();
+    r.lang = 'ko-KR';
+    r.continuous = contChk.checked;
+    r.interimResults = true;
+    r.maxAlternatives = 1;
+
+    r.onstart = () => { running = true; setUI(true); statusEl.textContent = '듣는 중...'; };
+
+    r.onresult = async (e) => {
+      let temp = '';
+      for (let i = e.resultIndex; i < e.results.length; i++) {
+        const txt = e.results[i][0].transcript;
+        if (e.results[i].isFinal) {
+          appendTo(koOut, txt);
+          if (autoTr.checked) {
+            const en = await translate(txt);
+            if (en) appendTo(enOut, en);
+            trInterim.textContent = '';
+          }
+        } else temp += txt;
+      }
+      interim.textContent = temp;
+      if (temp) debouncedInterimTranslate(temp);
+    };
+
+    r.onerror = (e) => {
+      statusEl.textContent = ({
+        'no-speech':'음성이 감지되지 않았습니다.',
+        'not-allowed':'마이크 권한이 거부되었습니다.',
+        'audio-capture':'마이크를 찾을 수 없습니다.',
+        'service-not-allowed':'음성 인식 서비스가 차단되었습니다.'
+      })[e.error] || ('오류: ' + e.error);
+      if (e.error === 'not-allowed' || e.error === 'audio-capture') manualStop = true;
+    };
+
+    r.onend = () => {
+      running = false; interim.textContent = '';
+      if (!manualStop && contChk.checked) { try { r.start(); return; } catch(_){} }
+      setUI(false); stopMeter(); statusEl.textContent = '정지됨';
+    };
+    return r;
+  }
+
+  function setUI(rec) {
+    startBtn.textContent = rec ? '정지' : '녹음 시작';
+    startBtn.classList.toggle('rec', rec);
+  }
+
+  /* ---------- 3. 입력 볼륨 미터 ---------- */
+  async function startMeter() {
+    try {
+      micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      analyser = audioCtx.createAnalyser(); analyser.fftSize = 512;
+      audioCtx.createMediaStreamSource(micStream).connect(analyser);
+      const buf = new Uint8Array(analyser.frequencyBinCount);
+      (function loop() {
+        analyser.getByteTimeDomainData(buf);
+        let s = 0;
+        for (let i=0;i<buf.length;i++){ const v=(buf[i]-128)/128; s += v*v; }
+        level.style.width = Math.min(100, Math.sqrt(s/buf.length)*300) + '%';
+        rafId = requestAnimationFrame(loop);
+      })();
+    } catch(_){}
+  }
+  function stopMeter() {
+    cancelAnimationFrame(rafId); level.style.width = '0%';
+    if (micStream) micStream.getTracks().forEach(t => t.stop());
+    if (audioCtx) audioCtx.close();
+    micStream = audioCtx = null;
+  }
+
+  /* ---------- 4. 버튼 ---------- */
+  startBtn.onclick = () => {
+    if (running) { manualStop = true; recog.stop(); }
+    else {
+      manualStop = false; recog = buildRecognizer();
+      try { recog.start(); startMeter(); }
+      catch (e) { statusEl.textContent = '시작 실패: ' + e.message; }
+    }
+  };
+
+  $('speakBtn').onclick = () => {
+    const t = enOut.value.trim(); if (!t) return;
+    const u = new SpeechSynthesisUtterance(t);
+    u.lang = 'en-US';
+    speechSynthesis.cancel(); speechSynthesis.speak(u);
+  };
+
+  $('clearBtn').onclick = () => {
+    koOut.value = enOut.value = '';
+    interim.textContent = trInterim.textContent = '';
+  };
+
+  $('copyBtn').onclick = async () => {
+    if (!enOut.value) return;
+    try { await navigator.clipboard.writeText(enOut.value); statusEl.textContent = '영문 복사됨'; }
+    catch(_) { enOut.select(); document.execCommand('copy'); statusEl.textContent='영문 복사됨'; }
+  };
+})();
+</script>
+</body>
+</html>
